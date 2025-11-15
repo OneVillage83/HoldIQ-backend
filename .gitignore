@@ -1,0 +1,13 @@
+# Python / env
+.venv/
+__pycache__/
+*.pyc
+
+# Local data and DB (do NOT push to GitHub)
+data/
+out/
+*.db
+*.log
+
+# PowerShell history, etc (optional)
+*.ps1History
