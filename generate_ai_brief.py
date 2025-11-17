@@ -1,338 +1,382 @@
-# generate_ai_brief.py
-
-import os
 import json
+import os
 import sqlite3
-from datetime import datetime
+import sys
+from typing import Optional, Tuple
 
 from openai import OpenAI
 
 DB_PATH = r".\data\holdiq.db"
-client = OpenAI()  # uses OPENAI_API_KEY from env
+OUT_DIR = r".\out"
+SNAPSHOT_DIR = OUT_DIR  # snapshots like snapshot_{cik}_{period}.json live here
 
-def fetch_manager_snapshot(con, cik, report_period):
-    cur = con.cursor()
 
-    # 1) Manager name & basic filing info (from filings)
-    mgr = cur.execute("""
-        SELECT company, filedAt, formType
-        FROM filings
-        WHERE cik = ?
-          AND reportPeriod = ?
-          AND formType LIKE '13F%'
-        ORDER BY filedAt DESC
-        LIMIT 1
-    """, (cik, report_period)).fetchone()
+# -------------------- DB HELPERS --------------------
 
-    manager_name = mgr[0] if mgr else None
-    filed_at = mgr[1] if mgr else None
-    form_type = mgr[2] if mgr else "13F-HR"
 
-    # 2) Positions snapshot (current quarter)
-    positions_rows = list(cur.execute("""
-        SELECT cik, reportPeriod, ticker, companyName,
-               value_usd, shares, weight_pct
-        FROM positions_13f
-        WHERE cik = ? AND reportPeriod = ?
-        ORDER BY weight_pct DESC
-        LIMIT 200
-    """, (cik, report_period)))
-
-    positions = [
-        dict(zip(
-            ["cik", "reportPeriod", "ticker", "companyName",
-             "value_usd", "shares", "weight_pct"],
-            row
-        ))
-        for row in positions_rows
-    ]
-
-    # --- Portfolio-level stats for richer AI commentary ---
-    total_value = sum(p["value_usd"] or 0 for p in positions) if positions else 0
-    n_positions = len(positions)
-
-    positions_sorted = sorted(
-        positions,
-        key=lambda p: p["weight_pct"] or 0,
-        reverse=True
-    )
-    top10 = positions_sorted[:10]
-    top10_weight = sum(p["weight_pct"] or 0 for p in top10) if positions_sorted else 0
-    largest_position = positions_sorted[0] if positions_sorted else None
-    tiny_positions = [p for p in positions_sorted if (p["weight_pct"] or 0) < 0.1]
-
-    portfolio_stats = {
-        "total_value_usd": total_value,
-        "n_positions": n_positions,
-        "top10_weight_pct": top10_weight,
-        "largest_position": largest_position,   # full dict
-        "n_tiny_positions": len(tiny_positions),
-    }
-
-    # 3) Changes vs prior quarter (deltas), INCLUDING SHARES & VALUES
-    deltas_rows = list(cur.execute("""
-        SELECT
-            delta_type,
-            ticker,
-            companyName,
-            delta_value_usd,
-            delta_weight_pct,
-            old_weight_pct,
-            new_weight_pct,
-            old_shares,
-            new_shares,
-            delta_shares,
-            old_value_usd,
-            new_value_usd
-        FROM positions_13f_delta
-        WHERE cik = ? AND reportPeriod = ?
-        ORDER BY
-            CASE delta_type
-                WHEN 'new' THEN 1
-                WHEN 'increase' THEN 2
-                WHEN 'decrease' THEN 3
-                WHEN 'closed' THEN 4
-                ELSE 5
-            END,
-            ABS(delta_value_usd) DESC
-        LIMIT 200
-    """, (cik, report_period)))
-
-    deltas = [
-        dict(zip(
-            [
-                "delta_type",
-                "ticker",
-                "companyName",
-                "delta_value_usd",
-                "delta_weight_pct",
-                "old_weight_pct",
-                "new_weight_pct",
-                "old_shares",
-                "new_shares",
-                "delta_shares",
-                "old_value_usd",
-                "new_value_usd",
-            ],
-            row
-        ))
-        for row in deltas_rows
-    ]
-
-    # 4) Insider transactions
-    insiders_rows = list(cur.execute("""
-        SELECT insider_name, ticker, companyName, tx_type, shares, price, tx_date
-        FROM insider_tx
-        WHERE cik = ?
-          AND tx_date >= date(?, '-90 day')
-          AND tx_date <= date(?, '+30 day')
-        ORDER BY tx_date DESC
-        LIMIT 200
-    """, (cik, report_period, report_period)))
-
-    insiders = [
-        dict(zip(
-            ["insider_name", "ticker", "companyName", "tx_type", "shares", "price", "tx_date"],
-            row
-        ))
-        for row in insiders_rows
-    ]
-
-    return {
-        "cik": cik,
-        "manager_name": manager_name,
-        "reportPeriod": report_period,
-        "filedAt": filed_at,
-        "formType": form_type,
-        "portfolio_stats": portfolio_stats,
-        "positions": positions,
-        "deltas": deltas,
-        "insiders": insiders,
-    }
-
-def build_prompt(context):
+def ensure_ai_briefs_table(con: sqlite3.Connection) -> None:
     """
-    Build the prompt given the structured context.
-    The context includes:
-      - portfolio_stats
-      - positions
-      - deltas  (with delta_value_usd, delta_weight_pct, old_weight_pct, new_weight_pct, etc.)
-      - insiders
+    Ensure the ai_briefs table exists with a unique row per (manager_cik, report_period, model).
     """
-
-    return f"""
-You are HoldIQ, an AI analyst that explains institutional portfolios
-and insider activity for retail investors in clear language.
-
-You are given structured data for one institutional manager's 13F filing,
-including positions, quarter-over-quarter changes, and insider transactions
-for related tickers.
-
-DATA (JSON):
-{json.dumps(context, indent=2)}
-
-PRIMARY GOAL:
-Do ALL the interpretive work for the end user. They should not need
-to calculate anything themselves. When you mention a ticker or a
-position change, you must include specific numbers whenever they are
-available in the JSON.
-
-CONCRETE NUMERIC BEHAVIOR (VERY IMPORTANT):
-
-- When describing a change for a specific ticker (e.g., AAPL, MSFT, UNH, CVS):
-  - Use the numeric fields from the JSON such as:
-    - delta_value_usd
-    - delta_weight_pct
-    - old_weight_pct, new_weight_pct
-    - old_shares, new_shares, delta_shares (if present)
-  - Express them in investor-friendly form, for example:
-    - "BlackRock trimmed AAPL by about $520M, cutting it from 7.2% to 5.8% of the portfolio."
-    - "They added roughly 2.3M shares of UNH, increasing its weight from 2.1% to 3.5%."
-  - Do NOT invent numbers; only transform the numbers already in the JSON
-    into rounded, readable figures.
-
-- If data is missing for a certain dimension:
-  - Use what is available (e.g., only dollar change or only weight change).
-  - Do NOT fabricate missing fields.
-
-- When talking about portfolio-level structure:
-  - Use portfolio_stats (e.g., total_value_usd, n_positions, top10_weight_pct)
-    and quote approximate figures like:
-    - "The manager reported roughly $18.4B across 63 positions."
-    - "The top 10 holdings account for about 58% of the disclosed portfolio."
-
-TASKS:
-
-1. Portfolio snapshot & style:
-   - Describe the overall portfolio: how many positions, how big it is in USD,
-     how concentrated it is in the top 10 holdings (with actual numbers).
-   - Comment on the apparent style: concentrated vs diversified, growth vs value
-     if reasonably inferable from the tickers/sectors (do not invent).
-   - Identify the single largest position and its approximate share of the portfolio
-     (e.g., "TSLA at ~9% of reported holdings").
-
-2. Changes vs prior quarter (deltas):
-   - List and explain the most important NEW positions (largest new allocations), with numbers.
-   - List and explain the biggest ADDITIONS (increased stakes), with numbers.
-   - List and explain the biggest TRIMS (reduced stakes), with numbers.
-   - List positions that were FULLY EXITED, especially if they were previously large,
-     and quantify the size they exited if you can (e.g., "previously ~3% position").
-
-3. Thematic & sector insights:
-   - Identify any sector or theme tilt (e.g., more tech, less healthcare,
-     more defensives, more cyclicals) if visible from the top holdings.
-   - Highlight clear rotations (e.g., out of mega-cap tech into financials),
-     tying to the numeric changes where possible.
-
-4. "Insider flavor" – connect insider activity to 13F moves:
-   - For tickers where insider_tx data exists, explain whether insiders
-     have been net buyers or sellers recently, including:
-       - rough number of shares
-       - direction (buy/sell)
-       - general timing
-   - Explain how insider activity aligns or conflicts
-     with the manager's moves (e.g., manager buying while insiders are selling).
-   - If there is little or no insider data, briefly state that.
-
-5. Risk and opportunity framing:
-   - RISKS: Identify portfolio-level risks (concentration, sector exposure,
-     crowding into popular names, high volatility names, etc.).
-   - OPPORTUNITIES: Identify potential upside themes (e.g., high conviction in a sector
-     or company with a strong narrative), but do NOT make price predictions.
-
-6. Output format:
-   Produce a JSON object with this exact structure:
-
-   {{
-     "headline": "...",               // max ~120 characters
-     "short_summary": "...",          // 2–3 sentences
-     "long_summary": "...",           // 3–6 paragraphs, detailed but clear
-     "bullets_free": ["...", "..."],  // 3–5 bullet points for free users
-     "bullets_premium": ["...", "..."], // 5–10 more detailed bullets
-     "risks": ["...", "..."],         // 3–5 key risk bullet points
-     "opportunities": ["...", "..."]  // 3–5 opportunity bullet points
-   }}
-
-RULES:
-- Use only information implied by the provided JSON.
-- Do NOT invent positions, trades, or numbers.
-- Always prefer precise, numeric statements over vague language when the data exists.
-- Avoid explicit investment advice or price targets; focus on explanation and structure.
-- Use plain-English, retail-friendly wording while remaining accurate.
-"""
-
-def call_model(prompt):
-    # You can change model name as desired
-    resp = client.chat.completions.create(
-        model="gpt-5.1-mini",
-        messages=[
-            {"role": "system", "content": "You are a financial analyst AI called HoldIQ."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.4,
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ai_briefs (
+            manager_cik TEXT NOT NULL,
+            report_period TEXT NOT NULL,
+            model       TEXT NOT NULL,
+            brief_md    TEXT NOT NULL,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (manager_cik, report_period, model)
+        )
+        """
     )
-    content = resp.choices[0].message.content
-    usage = resp.usage
-
-    # Ensure JSON parse
-    data = json.loads(content)
-    return data, usage, resp.model
-
-def save_brief(con, cik, manager_name, report_period, form_type,
-               brief_type, payload, model_name, usage):
-    cur = con.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO ai_briefs
-            (cik, manager_name, reportPeriod, formType, brief_type,
-             json_payload, created_at, model_name, input_tokens, output_tokens)
-        VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?)
-    """, (
-        cik,
-        manager_name,
-        report_period,
-        form_type,
-        brief_type,
-        json.dumps(payload),
-        model_name,
-        getattr(usage, "prompt_tokens", None),
-        getattr(usage, "completion_tokens", None),
-    ))
     con.commit()
 
-def generate_brief_for_manager(cik, report_period):
-    con = sqlite3.connect(DB_PATH)
 
-    context = fetch_manager_snapshot(con, cik, report_period)
+def get_cached_brief(
+    con: sqlite3.Connection, cik: str, period: str, model_label: str
+) -> Optional[str]:
+    """
+    Return cached brief text for (cik, period, model_label) if present.
+    """
+    row = con.execute(
+        """
+        SELECT brief_md
+        FROM ai_briefs
+        WHERE manager_cik = ?
+          AND report_period = ?
+          AND model = ?
+        """,
+        (cik, period, model_label),
+    ).fetchone()
 
-    if not context["positions"]:
-        print(f"No positions_13f data for CIK {cik} / {report_period}")
-        return
+    return row[0] if row else None
 
-    prompt = build_prompt(context)
-    payload, usage, model_name = call_model(prompt)
 
-    save_brief(
-        con,
-        cik=context["cik"],
-        manager_name=context["manager_name"],
-        report_period=context["reportPeriod"],
-        form_type="13F-HR",
-        brief_type="13F-summary",
-        payload=payload,
-        model_name=model_name,
-        usage=usage,
+def cache_brief(
+    con: sqlite3.Connection, cik: str, period: str, model_label: str, brief_md: str
+) -> None:
+    """
+    Upsert brief text into ai_briefs.
+    """
+    con.execute(
+        """
+        INSERT OR REPLACE INTO ai_briefs
+            (manager_cik, report_period, model, brief_md, created_at)
+        VALUES
+            (?, ?, ?, ?, datetime('now'))
+        """,
+        (cik, period, model_label, brief_md),
+    )
+    con.commit()
+
+
+def get_latest_period(con: sqlite3.Connection, cik: str) -> Optional[str]:
+    """
+    Get the most recent report_period in positions_13f for this manager.
+    """
+    row = con.execute(
+        """
+        SELECT report_period
+        FROM positions_13f
+        WHERE manager_cik = ?
+          AND report_period IS NOT NULL
+          AND report_period <> ''
+        ORDER BY report_period DESC
+        LIMIT 1
+        """,
+        (cik,),
+    ).fetchone()
+
+    return row[0] if row else None
+
+
+# -------------------- SNAPSHOT I/O --------------------
+
+
+def load_snapshot(cik: str, period: str) -> dict:
+    """
+    Load precomputed JSON snapshot: snapshot_{cik}_{period}.json
+    This file is created by fetch_manager_snapshot.py.
+    """
+    path = os.path.join(SNAPSHOT_DIR, f"snapshot_{cik}_{period}.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Snapshot file not found: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# -------------------- MODEL / TIER RESOLUTION --------------------
+
+
+def resolve_model(mode: Optional[str]) -> Tuple[str, str, str]:
+    """
+    Map a user 'mode' string to (model_name, model_label, tier):
+
+    - nano/fast      -> gpt-5-nano   (tier='nano')
+    - standard/mini  -> gpt-5-mini   (tier='mini')
+    - premium/pro/5.1-> gpt-5.1      (tier='premium')
+
+    If mode is None or unknown, default to nano.
+    """
+    if not mode:
+        return "gpt-5-nano", "gpt-5-nano", "nano"
+
+    m = mode.lower()
+    if m in ("fast", "nano"):
+        return "gpt-5-nano", "gpt-5-nano", "nano"
+    if m in ("standard", "mini"):
+        return "gpt-5-mini", "gpt-5-mini", "mini"
+    if m in ("premium", "pro", "5.1", "gpt-5.1"):
+        return "gpt-5.1", "gpt-5.1", "premium"
+
+    # Fallback
+    return "gpt-5-nano", "gpt-5-nano", "nano"
+
+
+# -------------------- PROMPT BUILDER --------------------
+
+
+def build_prompt_from_snapshot(snapshot: dict, tier: str) -> str:
+    """
+    Build the appropriate prompt template (nano, mini, premium)
+    using the snapshot dict.
+    """
+
+    # We'll embed the snapshot as JSON so the model sees full context.
+    snapshot_str = json.dumps(snapshot, ensure_ascii=False)
+
+    if tier == "nano":
+        prompt = f"""
+You are an AI that generates concise, factual portfolio summaries using only the data provided.
+
+Portfolio Data (JSON):
+{snapshot_str}
+
+Produce a clear, bullet-based summary with:
+- Total number of holdings
+- Total portfolio value
+- Top 5 holdings with:
+   • ticker
+   • issuer name
+   • weight (%) 
+   • market value ($)
+
+- Top 3 sectors by total value
+- One-sentence risk summary
+
+Format strictly like this:
+
+Portfolio Summary
+-----------------
+• Total Value: $X  
+• Total Positions: N  
+• Top Holdings:
+   1. TICKER – WEIGHT% (~$VALUE)
+   2. …
+   3. …
+   4. …
+   5. …
+
+Sector Mix
+----------
+• Sector – %  
+• Sector – %  
+• Sector – %  
+
+Risk Note
+---------
+• Single bullet on the portfolio’s main concentration risk.
+"""
+        return prompt.strip()
+
+    if tier == "mini":
+        prompt = f"""
+You are a portfolio analyst producing a professional but concise portfolio brief for a financial intelligence platform.
+
+Portfolio Data (JSON):
+{snapshot_str}
+
+Generate:
+
+1) Overview (2–3 sentences)
+   - Describe style, diversification, sector bias, and concentration.
+
+2) Top Holdings Table
+   - Top 5 holdings with ticker, issuer, weight %, and market value.
+
+3) Sector Allocation
+   - Top 3 sectors by total weight or value.
+
+4) Key Insights (3 bullets)
+   - Focus on concentration risk, notable exposures, and performance drivers.
+
+5) What This Means for Investors (2 bullets)
+   - Keep it actionable and practical.
+
+Tone: concise, factual, professional. Use section headers.
+"""
+        return prompt.strip()
+
+    # premium
+    prompt = f"""
+You are a senior institutional equity strategist creating a high-depth research brief based solely on the provided holdings dataset.
+
+Portfolio Data (JSON):
+{snapshot_str}
+
+Deliver:
+
+1. Executive Summary (3–4 sentences)
+   - Portfolio style, concentration profile, risk drivers, and factor tilts.
+
+2. Top Holdings Analysis
+   - Top 10 holdings with ticker, issuer, weight %, and market value.
+   - Commentary on how these holdings define portfolio behavior.
+
+3. Sector & Factor Exposure
+   - Top 5 sectors with approximate weights.
+   - Discuss style tilts: growth/value, large/small cap, AI/semiconductor exposure, defensives vs cyclicals.
+
+4. Concentration & Risk Assessment
+   - Concentration metrics and dependency on mega-cap leadership.
+   - Sensitivity to sector/factor rotation.
+   - 2–3 concrete risk scenarios.
+
+5. Suggested Investor Interpretation
+   - What the positioning implies.
+   - What to monitor going forward.
+
+Tone: authoritative, analytical, data-driven.
+Use clear section headers. Do not hallucinate data—rely only on the JSON snapshot.
+"""
+    return prompt.strip()
+
+
+# -------------------- OPENAI CALL --------------------
+
+
+def generate_brief_text(snapshot: dict, model: str, tier: str) -> str:
+    """
+    Call OpenAI Chat Completions API and return the brief text.
+    """
+    client = OpenAI()
+
+    prompt = build_prompt_from_snapshot(snapshot, tier)
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a meticulous institutional equity analyst.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
     )
 
+    text = resp.choices[0].message.content or ""
+    return text.strip()
+
+
+# -------------------- CLI PARSING --------------------
+
+
+def parse_args(argv: list[str]) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Return (cik, period, mode).
+
+    Allowed call patterns:
+        py generate_ai_brief.py CIK
+        py generate_ai_brief.py CIK PERIOD
+        py generate_ai_brief.py CIK PERIOD MODE
+        py generate_ai_brief.py CIK MODE
+    """
+    if len(argv) < 2:
+        print("Usage: py generate_ai_brief.py CIK [PERIOD] [MODE]")
+        sys.exit(1)
+
+    cik = argv[1]
+
+    if len(argv) == 2:
+        # Only CIK
+        return cik, None, None
+
+    if len(argv) == 3:
+        # Could be (CIK, MODE) OR (CIK, PERIOD)
+        a2 = argv[2].lower()
+        if a2 in ("standard", "mini", "fast", "nano", "premium", "pro", "5.1", "gpt-5.1"):
+            return cik, None, a2
+        # Treat as (CIK, PERIOD)
+        return cik, argv[2], None
+
+    # len(argv) >= 4 -> treat as (CIK, PERIOD, MODE)
+    return cik, argv[2], argv[3]
+
+
+# -------------------- MAIN --------------------
+
+
+def main() -> None:
+    cik, period, mode = parse_args(sys.argv)
+    model, model_label, tier = resolve_model(mode)
+
+    if "OPENAI_API_KEY" not in os.environ:
+        print("❌ OPENAI_API_KEY not found in environment.")
+        return
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    con = sqlite3.connect(DB_PATH)
+    ensure_ai_briefs_table(con)
+
+    # If no period provided, use most recent
+    if not period:
+        period = get_latest_period(con, cik)
+        if not period:
+            print(f"❌ No report_period found for CIK {cik} in positions_13f.")
+            con.close()
+            return
+        print(f"ℹ️ Using latest report_period for {cik}: {period}")
+
+    print(f"Manager {cik} | period={period} | model={model_label} (tier={tier})")
+
+    # Check cache
+    cached = get_cached_brief(con, cik, period, model_label)
+    if cached:
+        print("✅ Using cached brief from ai_briefs.")
+        brief = cached
+    else:
+        # Load snapshot
+        snapshot = load_snapshot(cik, period)
+
+        print("🧠 Calling OpenAI Chat Completions API...")
+        try:
+            brief = generate_brief_text(snapshot, model, tier)
+        except Exception as e:
+            print(f"❌ Error generating brief: {e}")
+            con.close()
+            return
+
+        cache_brief(con, cik, period, model_label, brief)
+        print("✅ Cached brief in ai_briefs.")
+
+    # Write to Markdown file
+    safe_model = model_label.replace(".", "_")
+    out_path = os.path.join(OUT_DIR, f"brief_{cik}_{period}_{safe_model}.md")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(brief)
+
+    print(f"✅ Wrote brief to {out_path}\n")
+    print("--- Preview ---\n")
+    print(brief[:1000])
+
     con.close()
-    print(f"✅ Saved AI brief for CIK {cik} / {report_period}")
+
 
 if __name__ == "__main__":
-    # Example: hardcode for now; later you loop over all managers/periods
-    import sys
-    if len(sys.argv) != 3:
-        print("Usage: python generate_ai_brief.py <cik> <reportPeriod-YYYY-MM-DD>")
-        raise SystemExit(1)
-
-    cik = sys.argv[1]
-    report_period = sys.argv[2]
-    generate_brief_for_manager(cik, report_period)
+    main()
